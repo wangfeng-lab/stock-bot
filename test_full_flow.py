@@ -80,7 +80,7 @@ row_no_bidask = pd.Series({
     'bid_price':       0,
     'ask_price':       0,
 })
-p2 = live_price_from_row(row_no_bidask)
+p2 = live_price_from_row(row_no_bidask, session='premarket')  # 明确指定盘前时段
 check("无 bid/ask 时盘前价优先（pre > overnight）", p2 == 493.00, f"got {p2}")
 
 row_regular = pd.Series({
@@ -160,12 +160,12 @@ initial = 1_000_000.0
 alloc   = 0.10   # 成长桶 10%
 
 b_gc = entry_budget(cash, initial, alloc, 'golden_cross', reserve_ratio=CASH_RESERVE)
-check("金叉预算 = 可用资金 × 100% alloc",
-      b_gc == 100_000.0, f"${b_gc:,.0f}")
+check("金叉预算 = 可用资金 × 40% alloc（分散模式）",
+      b_gc == 40_000.0, f"${b_gc:,.0f}")
 
 b_pb = entry_budget(cash, initial, alloc, 'trend_pullback', reserve_ratio=CASH_RESERVE)
-check("回踩预算 = 可用资金 × 60% alloc",
-      b_pb == 60_000.0, f"${b_pb:,.0f}")
+check("回踩预算 = 可用资金 × 30% alloc（分散模式）",
+      b_pb == 30_000.0, f"${b_pb:,.0f}")
 
 b_p2 = entry_budget(cash, initial, alloc, 'pyramid_stage2', reserve_ratio=CASH_RESERVE)
 check("金字塔②预算 = 可用资金 × 30% alloc",
@@ -222,19 +222,19 @@ print("\n" + "="*60)
 print("  5. 金字塔加仓条件")
 print("="*60)
 
-add_count = 0; pnl_pct = 0.06; days = 8; trend = True; rsi_ok = True
+add_count = 0; pnl_pct = 0.05; days = 5; trend = True; rsi_ok = True
 should_add2 = (add_count < 1 and pnl_pct >= PYRAMID_ADD1_PROFIT
                and days >= PYRAMID_ADD1_DAYS and trend and rsi_ok)
-check("金字塔②条件：+5%/7天/趋势 → 触发", should_add2)
+check(f"金字塔②条件：+{PYRAMID_ADD1_PROFIT*100:.0f}%/{PYRAMID_ADD1_DAYS}天/趋势 → 触发", should_add2)
 
-add_count = 0; pnl_pct = 0.03  # 未达 +5%
+add_count = 0; pnl_pct = 0.02  # 未达门槛
 should_add2_no = (add_count < 1 and pnl_pct >= PYRAMID_ADD1_PROFIT and days >= PYRAMID_ADD1_DAYS)
-check("金字塔②条件：+3% 不触发", not should_add2_no)
+check(f"金字塔②条件：+2% 不触发（门槛{PYRAMID_ADD1_PROFIT*100:.0f}%）", not should_add2_no)
 
-add_count = 1; pnl_pct = 0.13; days = 15; trend = True
+add_count = 1; pnl_pct = 0.10; days = 10; trend = True
 should_add3 = (add_count == 1 and pnl_pct >= PYRAMID_ADD2_PROFIT
                and days >= PYRAMID_ADD2_DAYS and trend)
-check("金字塔③条件：add_count=1/+12%/14天 → 触发", should_add3)
+check(f"金字塔③条件：add_count=1/+{PYRAMID_ADD2_PROFIT*100:.0f}%/{PYRAMID_ADD2_DAYS}天 → 触发", should_add3)
 
 # ─────────────────────────────────────────────────
 print("\n" + "="*60)

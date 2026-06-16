@@ -17,7 +17,7 @@ class ExecutionPolicyTests(unittest.TestCase):
             bucket_alloc=0.0,
             reason='micro_position',
         )
-        self.assertEqual(budget, 500.0)
+        self.assertEqual(budget, 300.0)
 
     def test_micro_budget_respects_cash_reserve(self):
         budget = entry_budget(
@@ -47,7 +47,7 @@ class ExecutionPolicyTests(unittest.TestCase):
             reason='add_position',
             current_position_value=40_000.0,
         )
-        self.assertEqual(budget, 20_000.0)
+        self.assertEqual(budget, 16_000.0)
 
     def test_cash_position_qty_returns_zero_when_budget_too_small(self):
         self.assertEqual(cash_position_qty(1200.0, 1000.0), 0)
@@ -59,7 +59,7 @@ class ExecutionPolicyTests(unittest.TestCase):
             budget=6_000.0,
             reason='trend_pullback',
         )
-        self.assertEqual(qty, 37)
+        self.assertEqual(qty, 35)
 
     def test_starter_position_threshold(self):
         self.assertTrue(is_starter_position(25_000.0, 1_000_000.0, 0.10, threshold=0.35))

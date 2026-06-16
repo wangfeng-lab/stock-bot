@@ -195,6 +195,7 @@ def backtest_stock(bucket_name: str,
                     cash, initial_cash, cfg['alloc'],
                     'pyramid_stage2',
                     reserve_ratio=CASH_RESERVE,
+                    use_dynamic_alloc=False,    # 回测不使用实时信号统计，避免前视偏差
                 )
                 add_qty = atr_position_qty(
                     raw_price, atr_val, budget,
@@ -233,6 +234,7 @@ def backtest_stock(bucket_name: str,
                     cash, initial_cash, cfg['alloc'],
                     'pyramid_stage3',
                     reserve_ratio=CASH_RESERVE,
+                    use_dynamic_alloc=False,    # 回测不使用实时信号统计，避免前视偏差
                 )
                 add_qty = atr_position_qty(
                     raw_price, atr_val, budget,
@@ -266,6 +268,7 @@ def backtest_stock(bucket_name: str,
                 cash, initial_cash, cfg['alloc'],
                 signal_reason,
                 reserve_ratio=CASH_RESERVE,
+                use_dynamic_alloc=False,    # 回测不使用实时信号统计，避免前视偏差
             )
             qty = atr_position_qty(
                 raw_price, atr_val, budget,

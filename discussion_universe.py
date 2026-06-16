@@ -131,6 +131,36 @@ def build_watch_universe(
     return list(dict.fromkeys(base + extras))
 
 
+def discussion_rank(code: str, payload: dict | None = None) -> int | None:
+    """返回股票在讨论热度榜单中的排名（1-based），不在榜单则返回 None。"""
+    data = payload or load_discussion_universe()
+    target = normalize_code(code)
+    for item in data.get('items', []):
+        if normalize_code(item.get('symbol', '')) == target:
+            return int(item.get('rank', 9999))
+    return None
+
+
+def discussion_alloc_modifier(code: str, payload: dict | None = None) -> tuple[float, str]:
+    """
+    根据讨论热度排名返回 alloc_mult 调整系数及说明。
+
+    逻辑：
+      rank  1-10  → 0.75：讨论极热（crowded trade），散户追高风险高，降权
+      rank 11-50  → 1.15：有关注但未过热，社区动量加成，适度加权
+      rank 51-200 → 1.00：在榜但不显著，不调整
+      不在榜单    → 1.00：无数据，不调整
+    """
+    rank = discussion_rank(code, payload)
+    if rank is None:
+        return 1.00, ''
+    if rank <= 10:
+        return 0.75, f'热榜#{rank}(过热降权)'
+    if rank <= 50:
+        return 1.15, f'热榜#{rank}(动量加成)'
+    return 1.00, f'热榜#{rank}'
+
+
 def fresh_metadata() -> dict:
     return {
         'generated_at': datetime.now(timezone.utc).isoformat(),

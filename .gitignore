@@ -9,6 +9,12 @@ pytest-cache-files-*/
 .DS_Store
 
 virtual_account.json
+virtual_account.sqlite3
+virtual_account.sqlite3-*
 trade_log.csv
 fundamental_cache.json
 sec_ticker_map.json
+signal_stats_cache.json
+
+quantlab/
+quantlab_new/

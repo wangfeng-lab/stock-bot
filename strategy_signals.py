@@ -254,3 +254,166 @@ def detect_momentum_surge(
         return None
 
     return 'momentum_surge', f"动量+{bar_chg:.1f}% 量{vol_ratio:.1f}x"
+
+
+# ══════════════════════════════════════════════════════════
+# 新增策略信号（散户实战四策略）
+# ══════════════════════════════════════════════════════════
+
+def calc_bollinger_bands(
+    close: pd.Series,
+    period: int = 20,
+    std_mult: float = 2.0,
+) -> tuple[pd.Series, pd.Series, pd.Series]:
+    """返回 (mid, upper, lower) 布林带"""
+    mid   = close.rolling(period).mean()
+    std   = close.rolling(period).std()
+    upper = mid + std_mult * std
+    lower = mid - std_mult * std
+    return mid, upper, lower
+
+
+def detect_rsi_bounce(
+    df: pd.DataFrame,
+    oversold: float = 32.0,
+    recover: float = 38.0,
+    rsi_period: int = 14,
+) -> tuple[str, str] | None:
+    """
+    RSI 超卖反弹策略（散户逻辑：跌深了要反弹）
+
+    条件：
+      - 前 N 根内 RSI 曾跌破 oversold（恐慌性抛售）
+      - 最新 RSI 回升到 recover 以上（企稳迹象）
+      - 价格在均线附近（不是纯粹跌势）
+
+    适用：保守桶 / 成长桶的低位布局
+    """
+    if len(df) < rsi_period + 10:
+        return None
+
+    rsi = calc_rsi(df['close'], rsi_period)
+    rsi_now  = float(rsi.iloc[-1])
+    rsi_prev = float(rsi.iloc[-5:-1].min())   # 近5根最低RSI
+
+    if rsi_prev > oversold:
+        return None   # 没有真正超卖过
+    if rsi_now < recover:
+        return None   # 还没企稳
+
+    return 'rsi_bounce', f"RSI超卖反弹 低点{rsi_prev:.0f}→{rsi_now:.0f}"
+
+
+def detect_bollinger_breakout(
+    df: pd.DataFrame,
+    bb_period: int = 20,
+    squeeze_threshold: float = 0.04,
+    std_mult: float = 2.0,
+) -> tuple[str, str] | None:
+    """
+    布林带收窄后向上突破（散户逻辑：盘整蓄力后爆发）
+
+    条件：
+      1. 近期布林带宽度 / 中轨 < squeeze_threshold（盘整收窄）
+      2. 当前收盘价突破上轨
+      3. 成交量配合
+
+    适用：短线桶 / 成长桶的爆发行情捕捉
+    """
+    if len(df) < bb_period + 5:
+        return None
+
+    mid, upper, lower = calc_bollinger_bands(df['close'], bb_period, std_mult)
+
+    # 近5根的布林带宽度均值（判断是否处于收窄状态）
+    bw_recent = ((upper - lower) / mid).iloc[-6:-1].mean()
+    if bw_recent > squeeze_threshold:
+        return None   # 还没有足够收窄
+
+    cur_price = float(df['close'].iloc[-1])
+    cur_upper = float(upper.iloc[-1])
+
+    if cur_price < cur_upper:
+        return None   # 还未突破上轨
+
+    # 成交量确认
+    vol_ratio = calc_volume_ratio(df, bb_period)
+
+    return 'bb_breakout', f"BB突破上轨{cur_upper:.2f} 宽度{bw_recent*100:.1f}% 量{vol_ratio:.1f}x"
+
+
+def detect_52w_high_breakout(
+    snap_row: pd.Series,
+    current_price: float,
+    within_pct: float = 0.03,
+) -> tuple[str, str] | None:
+    """
+    52周新高突破（散户逻辑：创新高说明机构在买，跟上）
+
+    条件：
+      - 当前价格在52周高点的 within_pct 范围内或已突破
+      - 不在52周低点附近（避免反弹陷阱）
+
+    数据来源：moomoo 快照的 highest52weeks_price
+    """
+    try:
+        high52 = float(snap_row.get('highest52weeks_price') or 0)
+        low52  = float(snap_row.get('lowest52weeks_price')  or 0)
+    except (TypeError, ValueError):
+        return None
+
+    if high52 <= 0 or current_price <= 0:
+        return None
+
+    dist_from_high = (high52 - current_price) / high52
+
+    # 在高点 within_pct 以内或已突破
+    if dist_from_high > within_pct:
+        return None
+
+    # 不能太靠近52周低点（说明只是弱势反弹）
+    if low52 > 0:
+        range52 = high52 - low52
+        if range52 > 0 and (current_price - low52) / range52 < 0.6:
+            return None
+
+    pct_str = f"距高点{dist_from_high*100:.1f}%" if dist_from_high > 0 else "突破52周高"
+    return '52w_high', f"52周新高区域 {pct_str}"
+
+
+def detect_macd_zero_cross(
+    df: pd.DataFrame,
+    fast: int = 12,
+    slow: int = 26,
+    signal: int = 9,
+) -> tuple[str, str] | None:
+    """
+    MACD 零轴上穿（散户逻辑：趋势由弱转强的明确信号）
+
+    条件：
+      - 前一根 MACD < 0
+      - 当前 MACD > 0（首次穿越零轴）
+      - MACD 柱状图扩大（动量加速）
+
+    比普通金叉更强：零轴上穿意味着短期均线整体超过长期均线
+    """
+    if len(df) < slow + signal + 5:
+        return None
+
+    macd_line, sig_line = calc_macd(df['close'], fast, slow, signal)
+    hist = macd_line - sig_line
+
+    m_now  = float(macd_line.iloc[-1])
+    m_prev = float(macd_line.iloc[-2])
+    h_now  = float(hist.iloc[-1])
+    h_prev = float(hist.iloc[-2])
+
+    # 零轴上穿
+    if not (m_prev < 0 and m_now > 0):
+        return None
+
+    # 柱状图扩大（动量增强）
+    if h_now <= h_prev:
+        return None
+
+    return 'macd_zero_cross', f"MACD零轴上穿 {m_prev:.3f}→{m_now:.3f}"

@@ -71,8 +71,32 @@ ENTRY_SIZE_POLICY: dict[str, dict[str, float | str]] = {
     # 动量加速：趋势中积极跟进
     'momentum_surge': {
         'kind': 'bucket_alloc',
-        'alloc_mult': 0.50,   # 动量明确，半仓
+        'alloc_mult': 0.50,
         'risk_mult': 0.90,
+    },
+    # RSI超卖反弹：低位布局，小仓试探
+    'rsi_bounce': {
+        'kind': 'bucket_alloc',
+        'alloc_mult': 0.30,
+        'risk_mult': 0.70,
+    },
+    # 布林带收窄突破：爆发行情，较积极
+    'bb_breakout': {
+        'kind': 'bucket_alloc',
+        'alloc_mult': 0.45,
+        'risk_mult': 0.85,
+    },
+    # 52周新高：机构买入信号，标准仓
+    '52w_high': {
+        'kind': 'bucket_alloc',
+        'alloc_mult': 0.50,
+        'risk_mult': 1.00,
+    },
+    # MACD零轴上穿：趋势确认，较积极
+    'macd_zero_cross': {
+        'kind': 'bucket_alloc',
+        'alloc_mult': 0.55,
+        'risk_mult': 0.95,
     },
     # 分批建仓 第二批（+5% 利润触发，占目标仓位约 30%）
     'pyramid_stage2': {
@@ -92,9 +116,13 @@ ENTRY_REASON_LABEL: dict[str, str] = {
     'weekly_dca': '每周定投',
     'uptrend':        '趋势底仓',
     'hot_sector':     '热门赛道',
-    'premarket_gap':  '盘前异动',
-    'momentum_surge': '动量加速',
-    'golden_cross':   '金叉',
+    'premarket_gap':   '盘前异动',
+    'momentum_surge':  '动量加速',
+    'rsi_bounce':      'RSI超卖反弹',
+    'bb_breakout':     'BB收窄突破',
+    '52w_high':        '52周新高',
+    'macd_zero_cross': 'MACD零轴上穿',
+    'golden_cross':    '金叉',
     'trend_pullback': '回踩确认',
     'breakout': '突破',
     'starter_promotion': 'starter晋级',
@@ -135,12 +163,17 @@ def entry_budget(cash: float,
                  bucket_alloc: float,
                  reason: str,
                  reserve_ratio: float = CASH_RESERVE_RATIO,
-                 current_position_value: float = 0.0) -> float:
+                 current_position_value: float = 0.0,
+                 use_dynamic_alloc: bool = True) -> float:
     """
     给定事件类型，返回本次允许使用的标准化预算。
     - fixed_cash    : 固定金额（底仓）
     - bucket_alloc  : 目标桶仓位 × 倍率
     - position_gap  : 目标仓位缺口内补仓，并限制补仓幅度
+
+    Args:
+        use_dynamic_alloc: 若 True，则通过 signal_stats 动态调整 alloc_mult。
+                           开关式设计，回测中可传 False 保持确定性。
     """
     policy = ENTRY_SIZE_POLICY.get(reason)
     if policy is None:
@@ -158,7 +191,18 @@ def entry_budget(cash: float,
     if bucket_cash <= 0:
         return 0.0
 
-    budget = min(liquid_cash, bucket_cash * float(policy.get('alloc_mult', 1.0)))
+    base_alloc_mult = float(policy.get('alloc_mult', 1.0))
+    if use_dynamic_alloc and kind == 'bucket_alloc':
+        # 延迟导入，避免循环依赖和启动时的性能开销
+        try:
+            from signal_stats import get_dynamic_alloc_mult
+            alloc_mult = get_dynamic_alloc_mult(reason, base_alloc_mult)
+        except Exception:
+            alloc_mult = base_alloc_mult
+    else:
+        alloc_mult = base_alloc_mult
+
+    budget = min(liquid_cash, bucket_cash * alloc_mult)
 
     if kind == 'position_gap':
         gap = max(0.0, bucket_cash - current_position_value)

@@ -1,3 +1,4 @@
+import calendar as pycal
 import streamlit as st
 import pandas as pd
 import json, os, time
@@ -9,7 +10,13 @@ from typing import cast
 from discussion_universe import build_watch_universe, discussion_codes, load_discussion_universe
 from fundamental_model import score_slow_fundamentals
 from fundamental_store import load_fundamental_cache
-from market_utils import live_price_from_row
+from local_broker import LocalBroker
+from market_utils import (
+    live_price_from_row,
+    display_price_from_row,
+    current_session, next_session_info, fmt_countdown,
+    SESSION_LABEL, SESSION_COLOR, now_et,
+)
 from performance import calc_pnl_metrics
 from recurring_invest import current_new_york_time, week_marker
 from screener import fundamental_score, volume_signal
@@ -28,6 +35,7 @@ from strategy_config import (
 
 BASE           = os.path.dirname(__file__)
 BROKER_DB      = os.path.join(BASE, 'virtual_account.json')
+BROKER_SQLITE  = os.path.join(BASE, 'virtual_account.sqlite3')
 LOG_FILE       = os.path.join(BASE, 'trade_log.csv')
 CUSTOM_WL_FILE = os.path.join(BASE, 'custom_watchlist.json')
 REFRESH        = 15
@@ -72,6 +80,33 @@ with st.sidebar:
         st.session_state.dark_mode = dark_val
         st.rerun()
     st.caption(f"每 {REFRESH} 秒自动刷新")
+
+    # ── 交易时段指示器 ────────────────────────────────────
+    _sess     = current_session()
+    _sess_lbl = SESSION_LABEL.get(_sess, _sess)
+    _sess_clr = SESSION_COLOR.get(_sess, '#888')
+    _nxt      = next_session_info()
+    _et_now   = now_et()
+
+    st.markdown(f"""
+<div style="
+    background:{_sess_clr}18;
+    border:1px solid {_sess_clr}55;
+    border-radius:10px;
+    padding:10px 14px;
+    margin:6px 0 4px;
+">
+  <div style="font-size:.75rem;color:{_sess_clr};font-weight:700;letter-spacing:.06em">
+    {_sess_lbl}
+  </div>
+  <div style="font-size:.7rem;color:#888;margin-top:3px">
+    美东 {_et_now.strftime('%H:%M:%S')}
+  </div>
+  <div style="font-size:.72rem;color:#aaa;margin-top:4px">
+    {_nxt['label']} <b style="color:{_sess_clr}">{fmt_countdown(_nxt['seconds'])}</b>
+  </div>
+</div>
+""", unsafe_allow_html=True)
     st.divider()
 
     # ── 自选股添加 ────────────────────────────────────────
@@ -237,6 +272,52 @@ section[data-testid="stSidebar"] small {{
 .group-title {{ font-size:.85rem; font-weight:600; color:{"#cbd5e1" if DARK else "#1e293b"}; }}
 .group-meta  {{ font-size:.72rem; color:{TEXT2}; }}
 
+.pnl-calendar {{
+    border:1px solid {BORDER};
+    border-radius:16px;
+    padding:14px;
+    background:{BG2};
+}}
+.pnl-calendar-grid {{
+    display:grid;
+    grid-template-columns:repeat(7,minmax(0,1fr));
+    gap:8px;
+}}
+.pnl-calendar-head {{
+    font-size:.72rem;
+    font-weight:700;
+    color:{TEXT2};
+    text-align:center;
+    padding:4px 0 6px;
+}}
+.pnl-calendar-cell {{
+    min-height:90px;
+    border-radius:12px;
+    border:1px solid {BORDER};
+    padding:10px 10px 8px;
+    display:flex;
+    flex-direction:column;
+    gap:6px;
+}}
+.pnl-calendar-empty {{
+    opacity:.45;
+}}
+.pnl-calendar-day {{
+    font-size:.78rem;
+    font-weight:700;
+    color:{TEXT};
+}}
+.pnl-calendar-pnl {{
+    font-size:.82rem;
+    font-weight:800;
+    line-height:1.1;
+}}
+.pnl-calendar-meta {{
+    font-size:.68rem;
+    color:{TEXT2};
+    line-height:1.25;
+}}
+
 #MainMenu, footer {{ visibility:hidden; }}
 .block-container  {{ padding-top:1.2rem; padding-bottom:2rem; }}
 </style>
@@ -244,9 +325,10 @@ section[data-testid="stSidebar"] small {{
 
 # ── 数据加载 ─────────────────────────────────────────────────
 
-@st.cache_data(ttl=30)
+@st.cache_data(ttl=15)
 def load_prices(stocks: tuple) -> dict:
     result = {}
+    sess = current_session()   # 取一次，整批用同一时段
     try:
         ctx = OpenQuoteContext(host='127.0.0.1', port=11111)
         batch_size = 25
@@ -263,7 +345,7 @@ def load_prices(stocks: tuple) -> dict:
                         last      = float(r['last_price']           or 0)
                         overnight = float(r['overnight_price']      or 0)
                         pre       = float(r['pre_price']            or 0)
-                        live = live_price_from_row(r)
+                        live = display_price_from_row(r, session=sess)
                         result[str(r['code'])] = {
                             'live':    live,
                             'last':    last,
@@ -284,7 +366,7 @@ def load_prices(stocks: tuple) -> dict:
                 last      = float(r['last_price']           or 0)
                 overnight = float(r['overnight_price']      or 0)
                 pre       = float(r['pre_price']            or 0)
-                live = live_price_from_row(r)
+                live = display_price_from_row(r, session=sess)
                 result[str(r['code'])] = {
                     'live':    live,          # 当前最新价（展示用）
                     'last':    last,          # 收盘价（评分参考用）
@@ -329,11 +411,12 @@ def load_klines(stocks: tuple) -> dict:
     return result
 
 def load_account() -> dict:
-    if not os.path.exists(BROKER_DB):
+    if not os.path.exists(BROKER_DB) and not os.path.exists(BROKER_SQLITE):
         return {'initial_cash':1_000_000,'cash':1_000_000,
-                'realized_pnl':0,'total_commission':0,'positions':{}}
-    with open(BROKER_DB) as f:
-        return json.load(f)
+                'reserved_cash':0,'realized_pnl':0,'total_commission':0,
+                'positions':{},'orders':[],'fills':[],'meta':{'markers':{}}}
+    broker = LocalBroker(BROKER_DB, LOG_FILE, initial_cash=1_000_000.0)
+    return broker.get_state()
 
 def load_trades() -> pd.DataFrame:
     if not os.path.exists(LOG_FILE):
@@ -358,6 +441,119 @@ def format_dual_time(dt: datetime) -> str:
     return (
         f"{dt.strftime('%Y-%m-%d %H:%M %Z')}"
         f" / {local_dt.strftime('%Y-%m-%d %H:%M %Z')}"
+    )
+
+
+def build_daily_fill_summary(fills: list[dict]) -> pd.DataFrame:
+    cols = ['trade_date', 'trade_count', 'buy_count', 'sell_count', 'realized_pnl', 'commission']
+    if not fills:
+        return pd.DataFrame(columns=cols)
+
+    df = pd.DataFrame(fills).copy()
+    if 'time' not in df.columns:
+        return pd.DataFrame(columns=cols)
+
+    df['time'] = pd.to_datetime(df['time'], errors='coerce')
+    df = df.dropna(subset=['time'])
+    if df.empty:
+        return pd.DataFrame(columns=cols)
+
+    df['side'] = df['side'].astype(str).str.upper()
+    df['commission'] = pd.to_numeric(df.get('commission'), errors='coerce').fillna(0.0)
+    df['pnl'] = pd.to_numeric(df.get('pnl'), errors='coerce')
+    df['trade_date'] = df['time'].dt.normalize()
+    df['buy_count'] = (df['side'] == 'BUY').astype(int)
+    df['sell_count'] = (df['side'] == 'SELL').astype(int)
+
+    summary = (
+        df.groupby('trade_date', as_index=False)
+          .agg(
+              trade_count=('side', 'size'),
+              buy_count=('buy_count', 'sum'),
+              sell_count=('sell_count', 'sum'),
+              realized_pnl=('pnl', lambda s: float(s.dropna().sum()) if not s.dropna().empty else 0.0),
+              commission=('commission', 'sum'),
+          )
+          .sort_values('trade_date')
+          .reset_index(drop=True)
+    )
+    return summary
+
+
+def render_daily_pnl_calendar(summary: pd.DataFrame, month_key: str) -> str:
+    if summary.empty:
+        return (
+            f'<div class="pnl-calendar"><div class="pnl-calendar-meta">'
+            f'暂无日度收益数据'
+            f'</div></div>'
+        )
+
+    month_ts = pd.Timestamp(f'{month_key}-01')
+    month_mask = summary['trade_date'].dt.to_period('M') == month_ts.to_period('M')
+    month_df = summary.loc[month_mask].copy()
+    month_map = {
+        int(row.trade_date.day): row
+        for row in month_df.itertuples(index=False)
+    }
+    scale = max(float(month_df['realized_pnl'].abs().max() or 0.0), 1.0)
+
+    def cell_style(pnl: float | None) -> str:
+        if pnl is None:
+            return f'background:{BG};border-color:{BORDER};'
+        alpha = min(0.35, max(0.08, abs(float(pnl)) / scale * 0.28))
+        if pnl > 0:
+            return f'background:rgba(34,197,94,{alpha:.3f});border-color:rgba(34,197,94,0.45);'
+        if pnl < 0:
+            return f'background:rgba(239,68,68,{alpha:.3f});border-color:rgba(239,68,68,0.45);'
+        return f'background:rgba(148,163,184,0.12);border-color:{BORDER};'
+
+    def pnl_text(pnl: float) -> str:
+        return f"${pnl:+,.0f}" if abs(pnl) >= 1000 else f"${pnl:+,.2f}"
+
+    week_headers = ''.join(
+        f'<div class="pnl-calendar-head">{label}</div>'
+        for label in ['一', '二', '三', '四', '五', '六', '日']
+    )
+
+    days_html: list[str] = []
+    cal = pycal.Calendar(firstweekday=0)
+    for week in cal.monthdayscalendar(month_ts.year, month_ts.month):
+        for day in week:
+            if day == 0:
+                days_html.append(
+                    '<div class="pnl-calendar-cell pnl-calendar-empty"></div>'
+                )
+                continue
+
+            row = month_map.get(day)
+            if row is None:
+                meta = '<div class="pnl-calendar-meta">无成交</div>'
+                pnl_block = '<div class="pnl-calendar-pnl flat">—</div>'
+                style = cell_style(None)
+            else:
+                pnl = float(row.realized_pnl or 0.0)
+                pnl_cls = 'up' if pnl > 0 else ('down' if pnl < 0 else 'flat')
+                pnl_block = f'<div class="pnl-calendar-pnl {pnl_cls}">{pnl_text(pnl)}</div>'
+                meta = (
+                    f'<div class="pnl-calendar-meta">'
+                    f'成交 {int(row.trade_count)} 笔<br>'
+                    f'买 {int(row.buy_count)} / 卖 {int(row.sell_count)}'
+                    f'</div>'
+                )
+                style = cell_style(pnl)
+
+            days_html.append(
+                f'<div class="pnl-calendar-cell" style="{style}">'
+                f'<div class="pnl-calendar-day">{day}</div>'
+                f'{pnl_block}'
+                f'{meta}'
+                f'</div>'
+            )
+
+    return (
+        f'<div class="pnl-calendar">'
+        f'<div class="pnl-calendar-grid">{week_headers}{"".join(days_html)}</div>'
+        f'</div>'
     )
 
 
@@ -488,6 +684,52 @@ def color_warn(val):
     if n <= -3: return 'color:#f59e0b;font-weight:600'
     return color_pnl(val)
 
+def color_status(val):
+    text = str(val)
+    if '已成交' in text:
+        return 'color:#22c55e;font-weight:600'
+    if '部分成交' in text:
+        return 'color:#f59e0b;font-weight:600'
+    if '待成交' in text:
+        return 'color:#3b82f6;font-weight:600'
+    if '已撤销' in text:
+        return 'color:#64748b;font-weight:600'
+    if '拒单' in text:
+        return 'color:#ef4444;font-weight:600'
+    return ''
+
+
+def format_order_message(msg: object) -> str:
+    text = str(msg or '').strip()
+    if not text:
+        return '—'
+    if text == 'timeout_no_quote':
+        return '无行情超时撤单'
+    if text == 'accepted':
+        return '已接受，等待成交'
+    if text.startswith('accepted_clipped:'):
+        payload = text.split(':', 1)[1]
+        return f'可卖数量不足，已按 {payload} 接受'
+    if text.startswith('auto_canceled_remainder:'):
+        payload = text.split(':', 1)[1]
+        return f'部分成交后撤余单 {payload}'
+    if text.startswith('partially_filled:'):
+        payload = text.split(':', 1)[1]
+        return f'部分成交 {payload}'
+    return text
+
+
+def format_order_reserved(row: pd.Series) -> str:
+    status = str(row.get('status', '') or '')
+    side = str(row.get('side', '') or '')
+    if any(token in status for token in ('已成交', '已撤销', '拒单')):
+        return '已释放'
+    if side.startswith('🟢'):
+        reserved_cash = float(row.get('reserved_cash', 0.0) or 0.0)
+        return f"预留 ${reserved_cash:,.2f}" if reserved_cash > 0 else '—'
+    reserved_qty = int(row.get('reserved_qty', 0) or 0)
+    return f"锁定 {reserved_qty} 股" if reserved_qty > 0 else '—'
+
 def s(n): return '+' if n >= 0 else ''
 
 # ── 主数据 ───────────────────────────────────────────────────
@@ -498,15 +740,58 @@ prices    = load_prices(tuple(ALL_STOCKS))
 klines    = load_klines(tuple(ALL_STOCKS))
 slow_fund_cache = load_slow_fundamentals()
 positions = account.get('positions', {})
+orders = list(account.get('orders', []))
+fills = list(account.get('fills', []))
+dailies = build_daily_fill_summary(fills)
 dca_status = weekly_dca_status(account, trades)
+reserved_cash = float(account.get('reserved_cash', 0.0) or 0.0)
+available_cash = max(0.0, float(account.get('cash', 0.0) or 0.0) - reserved_cash)
+open_orders = [
+    o for o in orders
+    if str(o.get('status', '') or '') in {'NEW', 'PARTIALLY_FILLED'}
+]
+open_buy_orders = sum(1 for o in open_orders if str(o.get('side', '') or '').upper() == 'BUY')
+open_sell_orders = sum(1 for o in open_orders if str(o.get('side', '') or '').upper() == 'SELL')
+terminal_orders = [
+    o for o in orders
+    if str(o.get('status', '') or '') in {'CANCELED', 'REJECTED'}
+]
+timeout_cancel_count = sum(
+    1 for o in terminal_orders
+    if str(o.get('status', '') or '') == 'CANCELED'
+    and str(o.get('message', '') or '') == 'timeout_no_quote'
+)
+latest_terminal_text = '—'
+if terminal_orders:
+    latest_terminal_order = max(
+        terminal_orders,
+        key=lambda o: str(o.get('updated_at', '') or ''),
+    )
+    latest_terminal_text = (
+        f"{str(latest_terminal_order.get('code', '') or '').replace('US.', '')} "
+        f"{format_order_message(latest_terminal_order.get('message', ''))}"
+    )
+reserved_qty_total = sum(int(p.get('reserved_qty', 0) or 0) for p in positions.values())
+fill_pnl_by_order: dict[str, float] = {}
+if fills:
+    _fill_pnl_df = pd.DataFrame(fills).copy()
+    if 'order_id' in _fill_pnl_df.columns:
+        _fill_pnl_df['pnl'] = pd.to_numeric(_fill_pnl_df.get('pnl'), errors='coerce')
+        fill_pnl_by_order = (
+            _fill_pnl_df.groupby('order_id')['pnl']
+            .sum(min_count=1)
+            .dropna()
+            .to_dict()
+        )
 
 mkt_val = unrealized = today_pnl = 0.0
 pos_rows = []
 
 for code, p in positions.items():
     px   = prices.get(code, {})
-    cur  = px.get('live', px.get('last', p['avg_cost']))
-    prev = px.get('prev', p['avg_cost'])
+    # 用 or 链：live/last 为 0 时自动降级，不用 dict.get 默认值（0 不触发默认值）
+    cur  = px.get('live') or px.get('last') or p['avg_cost']
+    prev = px.get('prev') or p['avg_cost']
     entry_str = p.get('entry_time','')
     try:
         entry_dt = datetime.strptime(entry_str, '%Y-%m-%d %H:%M:%S')
@@ -515,7 +800,7 @@ for code, p in positions.items():
         entry_dt = None
         is_new_today = False
 
-    # 今日新开的仓位，不应把买入前的日内涨跌算进“今日盈亏”
+    # 今日新开的仓位，不应把买入前的日内涨跌算进"今日盈亏"
     day_ref = p['avg_cost'] if is_new_today else prev
     val  = cur * p['qty']
     unr  = (cur - p['avg_cost']) * p['qty']
@@ -546,6 +831,8 @@ for code, p in positions.items():
         '板块':     SECTOR_MAP.get(code,'其他'),
         '策略':     BUCKET_LABEL.get(p.get('bucket',''),''),
         '数量':     p['qty'],
+        '可卖数量':  max(0, int(p.get('qty', 0) or 0) - int(p.get('reserved_qty', 0) or 0)),
+        '锁定数量':  int(p.get('reserved_qty', 0) or 0),
         '成本价':   p['avg_cost'],
         '现价':     cur,
         '市值':     val,
@@ -563,9 +850,16 @@ real  = account['realized_pnl']
 comm  = account['total_commission']
 t_ret = (total - init) / init * 100
 t_pct = today_pnl / (total - today_pnl) * 100 if total != today_pnl else 0
-trade_count = len(trades)
+trade_count = len(fills) if fills else len(trades)
 buy_count = int(trades['side'].eq('BUY').sum()) if 'side' in trades.columns else 0
 sell_count = int(trades['side'].eq('SELL').sum()) if 'side' in trades.columns else 0
+today_key = pd.Timestamp.now().normalize()
+today_daily = dailies.loc[dailies['trade_date'] == today_key]
+today_realized = float(today_daily['realized_pnl'].iloc[0]) if not today_daily.empty else 0.0
+today_fill_count = int(today_daily['trade_count'].iloc[0]) if not today_daily.empty else 0
+today_buy_fills = int(today_daily['buy_count'].iloc[0]) if not today_daily.empty else 0
+today_sell_fills = int(today_daily['sell_count'].iloc[0]) if not today_daily.empty else 0
+today_realized_cls = 'up' if today_realized > 0 else ('down' if today_realized < 0 else 'flat')
 
 # ══════════════════════════════════════════════════════════
 # 顶部英雄区域
@@ -601,17 +895,25 @@ st.markdown(f"""
   <div class="kpi">
     <div class="kpi-label">现金余额</div>
     <div class="kpi-value">${account['cash']:,.0f}</div>
-    <div class="kpi-sub">{account['cash']/total*100:.1f}% 占比</div>
+    <div class="kpi-sub">可用 ${available_cash:,.0f} · {account['cash']/total*100:.1f}% 占比</div>
+    <div class="kpi-subline">预留 ${reserved_cash:,.2f}</div>
   </div>
   <div class="kpi">
     <div class="kpi-label">持仓市值</div>
     <div class="kpi-value">${mkt_val:,.0f}</div>
     <div class="kpi-sub">{len(positions)} 只 · {mkt_val/total*100:.1f}%</div>
+    <div class="kpi-subline">锁定卖出 {reserved_qty_total} 股</div>
   </div>
   <div class="kpi">
     <div class="kpi-label">今日最佳</div>
     <div class="kpi-value up">{max((r['今日%'] for r in pos_rows), default=0):+.2f}%</div>
     <div class="kpi-sub">{max(pos_rows, key=lambda r:r['今日%'], default={'股票':'—'})['股票']}</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">当日已实现收益</div>
+    <div class="kpi-value {today_realized_cls}">${today_realized:+,.2f}</div>
+    <div class="kpi-sub">成交 {today_fill_count} 笔 · 买 {today_buy_fills} / 卖 {today_sell_fills}</div>
+    <div class="kpi-subline">仅统计已成交流水中的当日已实现结果</div>
   </div>
   <div class="kpi">
     <div class="kpi-label">20% 储备线</div>
@@ -622,6 +924,14 @@ st.markdown(f"""
     <div class="kpi-label">累计手续费</div>
     <div class="kpi-value">${comm:.2f}</div>
     <div class="kpi-sub">{pd.Timestamp.now().strftime('%H:%M:%S')} 刷新</div>
+  </div>
+  <div class="kpi">
+    <div class="kpi-label">待处理订单</div>
+    <div class="kpi-value">{len(open_orders)}</div>
+    <div class="kpi-sub">买单 {open_buy_orders} · 卖单 {open_sell_orders}</div>
+    <div class="kpi-subline">订单账本 {len(orders)} 笔</div>
+    <div class="kpi-subline">超时撤单 {timeout_cancel_count} 笔</div>
+    <div class="kpi-subline">最近撤单：{latest_terminal_text}</div>
   </div>
   <div class="kpi">
     <div class="kpi-label">本周定投状态</div>
@@ -644,7 +954,7 @@ st.markdown(f"""
 t1, t2, t3, t4, t5 = st.tabs(["💼 持仓", "🔍 自选股雷达", "📈 盈亏曲线", "📋 交易记录", "📊 绩效分析"])
 
 PNL_COLS  = ['未实现盈亏','收益率%','今日盈亏','今日%']
-BASE_COLS = ['股票','板块','策略','数量','成本价','现价','市值',
+BASE_COLS = ['股票','板块','策略','数量','可卖数量','锁定数量','成本价','现价','市值',
              '未实现盈亏','收益率%','今日盈亏','今日%','持仓天数']
 HOLDING_SORT_OPTIONS = {
     '默认顺序': None,
@@ -948,6 +1258,38 @@ with t2:
         st.warning("雷达页暂无可用行情数据。请检查 OpenD 连接或稍后刷新。")
     else:
         rdf = pd.DataFrame(radar).sort_values('评分', ascending=False)
+        pre_df = rdf[rdf['盘前%'].notna()].copy()
+        if not pre_df.empty:
+            st.subheader("盘前异动榜")
+            pre_rank = pre_df.loc[pre_df['盘前%'].abs() >= 1.0].copy()
+            if not pre_rank.empty:
+                c_up, c_dn = st.columns(2)
+                with c_up:
+                    st.caption("盘前上涨 Top 8")
+                    pre_up = pre_rank.sort_values('盘前%', ascending=False).head(8)
+                    st.dataframe(
+                        pre_up[['股票', '板块', '现价', '盘前%', '评分', '信号']]
+                            .style
+                            .format({'现价': '${:.2f}', '盘前%': '{:+.2f}%'})
+                            .map(color_pnl, subset=['盘前%'])
+                            .map(color_score, subset=['评分']),
+                        width="stretch",
+                        hide_index=True,
+                    )
+                with c_dn:
+                    st.caption("盘前下跌 Top 8")
+                    pre_dn = pre_rank.sort_values('盘前%').head(8)
+                    st.dataframe(
+                        pre_dn[['股票', '板块', '现价', '盘前%', '评分', '信号']]
+                            .style
+                            .format({'现价': '${:.2f}', '盘前%': '{:+.2f}%'})
+                            .map(color_pnl, subset=['盘前%'])
+                            .map(color_score, subset=['评分']),
+                        width="stretch",
+                        hide_index=True,
+                    )
+                st.caption("策略已接入盘前异动信号：默认阈值为盘前涨幅 ≥ 2% 且盘前量 ≥ 5万股。")
+
         styled = (rdf.style
                   .format({'现价':'${:.2f}',
                            '今日%':   lambda x: f'{x:+.2f}%' if pd.notna(x) else '—',
@@ -989,46 +1331,191 @@ with t3:
                                .map(color_pnl, subset=['未实现']),
                              width="stretch", hide_index=True)
 
+    st.divider()
+    st.subheader("每日收益日历")
+    if dailies.empty:
+        st.info("暂无按日汇总的成交流水。")
+    else:
+        month_options = (
+            dailies['trade_date']
+            .dt.strftime('%Y-%m')
+            .drop_duplicates()
+            .sort_values(ascending=False)
+            .tolist()
+        )
+        selected_month = st.selectbox(
+            "选择月份",
+            month_options,
+            index=0,
+            key="daily_pnl_calendar_month",
+        )
+        st.markdown(render_daily_pnl_calendar(dailies, selected_month), unsafe_allow_html=True)
+        st.caption("当前日历按已实现收益统计：绿色为盈利日，红色为亏损日；无持仓市值快照的历史日期暂不回放总资产日收益。")
+
+        daily_show = dailies.copy().sort_values('trade_date', ascending=False)
+        daily_show['日期'] = daily_show['trade_date'].dt.strftime('%Y-%m-%d')
+        daily_show = daily_show.rename(columns={
+            'trade_count': '成交笔数',
+            'buy_count': '买入',
+            'sell_count': '卖出',
+            'realized_pnl': '已实现收益',
+            'commission': '手续费',
+        })
+        st.dataframe(
+            daily_show[['日期', '成交笔数', '买入', '卖出', '已实现收益', '手续费']]
+                .style
+                .format({'已实现收益': '${:+,.2f}', '手续费': '${:,.2f}'})
+                .map(color_pnl, subset=['已实现收益']),
+            width="stretch",
+            hide_index=True,
+        )
+
 # ── Tab 4：交易记录 ──────────────────────────────────────────
 with t4:
-    if trades.empty:
-        st.info("暂无记录")
-    else:
-        disp = trades.copy().iloc[::-1].reset_index(drop=True)
-        disp['side']   = disp['side'].map({'BUY':'🟢 买入','SELL':'🔴 卖出'}).fillna(disp['side'])
-        disp['reason'] = disp['reason'].map({
-            'weekly_dca':'每周定投',
-            'golden_cross':'金叉','trend_pullback':'回踩确认','breakout':'突破',
-            'death_cross':'死叉','stop_loss':'止损','trailing_stop':'移动止损',
-            'rsi_overbought':'RSI超买','partial_profit':'分批止盈',
-            'init_position':'初始建仓','add_position':'加码',
-            'micro_position':'底仓建仓','micro_stop_loss':'底仓止损',
-        }).fillna(disp['reason'])
-        disp['bucket'] = disp['bucket'].map(BUCKET_LABEL).fillna(disp['bucket'])
-        disp = disp.rename(columns={'time':'时间','stock':'股票','bucket':'策略',
-                                    'side':'方向','price':'价格','qty':'数量',
-                                    'reason':'原因','pnl':'盈亏'})
-        disp_show = disp[['时间','股票','策略','方向','价格','数量','原因','盈亏']].copy()
-        disp_show['价格'] = disp_show['价格'].map(
-            lambda x: f'${x:.2f}' if pd.notna(x) else '—'
-        )
-        disp_show['盈亏'] = disp_show['盈亏'].map(
-            lambda x: f'${x:+.2f}' if pd.notna(x) else '—'
-        )
-        st.dataframe(
-            disp_show.style
-                .map(color_pnl, subset=['盈亏']),
-            width="stretch", hide_index=True)
-        st.divider()
-        wins  = (sells['pnl']>0).sum() if not sells.empty else 0
-        losses= (sells['pnl']<=0).sum() if not sells.empty else 0
-        total_t = len(sells)
-        s1,s2,s3,s4,s5 = st.columns(5)
-        s1.metric("已完成",   f"{total_t} 笔")
-        s2.metric("胜率",     f"{wins/total_t*100:.1f}%" if total_t else "—")
-        s3.metric("平均盈利", f"${sells[sells['pnl']>0]['pnl'].mean():+.2f}"  if wins   else "—")
-        s4.metric("平均亏损", f"${sells[sells['pnl']<=0]['pnl'].mean():+.2f}" if losses else "—")
-        s5.metric("手续费",   f"${comm:.2f}")
+    order_status_map = {
+        'NEW': '🟦 待成交',
+        'PARTIALLY_FILLED': '🟨 部分成交',
+        'FILLED': '🟢 已成交',
+        'CANCELED': '⚪ 已撤销',
+        'REJECTED': '🔴 拒单',
+    }
+    q1, q2 = st.columns(2)
+    q1.metric("待处理订单", f"{len(open_orders)} 笔", f"买 {open_buy_orders} / 卖 {open_sell_orders}")
+    q2.metric("可用现金", f"${available_cash:,.2f}", f"预留 ${reserved_cash:,.2f}")
+
+    order_tab, fill_tab, trade_tab = st.tabs(["📨 订单状态", "✅ 成交流水", "📋 交易日志"])
+
+    with order_tab:
+        if not orders:
+            st.info("暂无订单记录")
+        else:
+            odf = pd.DataFrame(orders).iloc[::-1].reset_index(drop=True)
+            odf['side'] = odf['side'].map({'BUY':'🟢 买入','SELL':'🔴 卖出'}).fillna(odf['side'])
+            odf['status'] = odf['status'].map(order_status_map).fillna(odf['status'])
+            odf['stock'] = odf['code'].str.replace('US.', '', regex=False)
+            odf['message'] = odf['message'].map(format_order_message)
+            odf['reserved'] = odf.apply(format_order_reserved, axis=1)
+            odf['avg_fill_price'] = odf['avg_fill_price'].map(
+                lambda x: f"${float(x):.2f}" if pd.notna(x) and x not in ('', None) else '-'
+            )
+            odf['requested_price'] = odf['requested_price'].map(lambda x: f"${float(x):.2f}")
+            odf['commission'] = odf['commission'].map(lambda x: f"${float(x):.2f}")
+
+            # 盈亏列：仅卖出且已成交时显示，买入或未成交显示 '—'
+            def _fmt_order_pnl(row):
+                raw_side = str(row.get('side', '') or '')
+                is_sell = '卖出' in raw_side or raw_side.upper() == 'SELL'
+                pnl = fill_pnl_by_order.get(str(row.get('order_id', '') or ''))
+                if not is_sell or pnl is None:
+                    return '—'
+                try:
+                    v = float(pnl)
+                    return f"+${v:,.2f}" if v >= 0 else f"-${abs(v):,.2f}"
+                except (ValueError, TypeError):
+                    return '—'
+
+            odf['盈亏'] = odf.apply(_fmt_order_pnl, axis=1)
+
+            odf_show = odf.rename(columns={
+                'submitted_at':'提交时间',
+                'order_id':'订单号',
+                'stock':'股票',
+                'side':'方向',
+                'status':'状态',
+                'requested_qty':'申请数量',
+                'filled_qty':'已成交',
+                'remaining_qty':'剩余',
+                'requested_price':'委托价',
+                'avg_fill_price':'成交均价',
+                'commission':'手续费',
+                'reason':'原因',
+                'message':'备注',
+                'reserved':'锁定资源',
+            })
+
+            def color_pnl(val):
+                if val == '—':
+                    return ''
+                return 'color:#22c55e' if val.startswith('+') else 'color:#ef4444'
+
+            st.dataframe(
+                odf_show[['提交时间','订单号','股票','方向','状态','申请数量','已成交','剩余','委托价','成交均价','锁定资源','手续费','原因','盈亏','备注']]
+                    .style
+                    .map(color_status, subset=['状态'])
+                    .map(color_pnl, subset=['盈亏']),
+                width="stretch",
+                hide_index=True,
+            )
+            st.caption('`手续费` 对应实际成交；`盈亏` 为卖出成交后的已实现损益（扣除手续费）；`锁定资源` 只表示订单尚未完成时占用的现金或可卖数量，成交后会显示"已释放"。')
+
+    with fill_tab:
+        if not fills:
+            st.info("暂无成交记录")
+        else:
+            fdf = pd.DataFrame(fills).iloc[::-1].reset_index(drop=True)
+            fdf['side'] = fdf['side'].map({'BUY':'🟢 买入','SELL':'🔴 卖出'}).fillna(fdf['side'])
+            fdf['stock'] = fdf['code'].str.replace('US.', '', regex=False)
+            fdf['price'] = fdf['price'].map(lambda x: f"${float(x):.2f}" if pd.notna(x) else '—')
+            fdf['commission'] = fdf['commission'].map(lambda x: f"${float(x):.2f}" if pd.notna(x) else '—')
+            fdf['pnl'] = fdf['pnl'].map(lambda x: f"${float(x):+.2f}" if pd.notna(x) else '—')
+            fdf_show = fdf.rename(columns={
+                'time':'时间',
+                'fill_id':'成交号',
+                'order_id':'订单号',
+                'stock':'股票',
+                'side':'方向',
+                'qty':'数量',
+                'price':'价格',
+                'commission':'手续费',
+                'reason':'原因',
+                'pnl':'盈亏',
+            })
+            st.dataframe(
+                fdf_show[['时间','成交号','订单号','股票','方向','数量','价格','手续费','原因','盈亏']]
+                    .style.map(color_pnl, subset=['盈亏']),
+                width="stretch",
+                hide_index=True,
+            )
+
+    with trade_tab:
+        if trades.empty:
+            st.info("暂无记录")
+        else:
+            disp = trades.copy().iloc[::-1].reset_index(drop=True)
+            disp['side']   = disp['side'].map({'BUY':'🟢 买入','SELL':'🔴 卖出'}).fillna(disp['side'])
+            disp['reason'] = disp['reason'].map({
+                'weekly_dca':'每周定投',
+                'golden_cross':'金叉','trend_pullback':'回踩确认','breakout':'突破',
+                'death_cross':'死叉','stop_loss':'止损','trailing_stop':'移动止损',
+                'rsi_overbought':'RSI超买','partial_profit':'分批止盈',
+                'init_position':'初始建仓','add_position':'加码',
+                'micro_position':'底仓建仓','micro_stop_loss':'底仓止损',
+            }).fillna(disp['reason'])
+            disp['bucket'] = disp['bucket'].map(BUCKET_LABEL).fillna(disp['bucket'])
+            disp = disp.rename(columns={'time':'时间','stock':'股票','bucket':'策略',
+                                        'side':'方向','price':'价格','qty':'数量',
+                                        'reason':'原因','pnl':'盈亏'})
+            disp_show = disp[['时间','股票','策略','方向','价格','数量','原因','盈亏']].copy()
+            disp_show['价格'] = disp_show['价格'].map(
+                lambda x: f'${x:.2f}' if pd.notna(x) else '—'
+            )
+            disp_show['盈亏'] = disp_show['盈亏'].map(
+                lambda x: f'${x:+.2f}' if pd.notna(x) else '—'
+            )
+            st.dataframe(
+                disp_show.style
+                    .map(color_pnl, subset=['盈亏']),
+                width="stretch", hide_index=True)
+            st.divider()
+            wins  = (sells['pnl']>0).sum() if not sells.empty else 0
+            losses= (sells['pnl']<=0).sum() if not sells.empty else 0
+            total_t = len(sells)
+            s1,s2,s3,s4,s5 = st.columns(5)
+            s1.metric("已完成",   f"{total_t} 笔")
+            s2.metric("胜率",     f"{wins/total_t*100:.1f}%" if total_t else "—")
+            s3.metric("平均盈利", f"${sells[sells['pnl']>0]['pnl'].mean():+.2f}"  if wins   else "—")
+            s4.metric("平均亏损", f"${sells[sells['pnl']<=0]['pnl'].mean():+.2f}" if losses else "—")
+            s5.metric("手续费",   f"${comm:.2f}")
 
 # ── Tab 5：绩效分析 ──────────────────────────────────────────
 with t5:
